@@ -74,6 +74,23 @@ class UserRepository:
         user = await self.get_by_telegram_id(telegram_id)
         return bool(user and user.is_blocked)
 
+    async def set_language(self, telegram_id: int, language: str) -> Optional[User]:
+        user = await self.get_by_telegram_id(telegram_id)
+        if not user:
+            return None
+        user.language = language
+        user.updated_at = datetime.now(timezone.utc)
+        settings_result = await self.session.execute(
+            select(Settings).where(Settings.user_id == user.id)
+        )
+        settings = settings_result.scalar_one_or_none()
+        if settings:
+            settings.language = language
+        else:
+            self.session.add(Settings(user_id=user.id, language=language))
+        await self.session.flush()
+        return user
+
 
 class SongRepository:
     def __init__(self, session: AsyncSession):

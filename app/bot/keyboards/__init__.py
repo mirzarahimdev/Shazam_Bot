@@ -1,153 +1,86 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
-from app.services.video_service import VIDEO_CATEGORIES
+from app.bot.i18n import t
+
+PAGE_SIZE = 10
 
 
-def main_menu_keyboard() -> ReplyKeyboardMarkup:
+def language_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🇺🇿 O'zbekcha", callback_data="lang:uz"),
+                InlineKeyboardButton(text="🇺🇿 Ўзбекча", callback_data="lang:uz_cyrl"),
+            ],
+            [
+                InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang:ru"),
+                InlineKeyboardButton(text="🇺🇸 English", callback_data="lang:en"),
+            ],
+        ]
+    )
+
+
+def main_menu_keyboard(lang: str = "uz") -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🎵 Musiqa qidirish"), KeyboardButton(text="🎧 Qo‘shiqni aniqlash")],
-            [KeyboardButton(text="💾 Video Save"), KeyboardButton(text="⭐️ Sevimlilar")],
-            [KeyboardButton(text="👤 Profil"), KeyboardButton(text="⚙️ Sozlamalar")],
+            [KeyboardButton(text=t(lang, "btn_music"))],
+            [
+                KeyboardButton(text=t(lang, "btn_clip")),
+                KeyboardButton(text=t(lang, "btn_lyrics")),
+            ],
         ],
         resize_keyboard=True,
     )
 
 
+def search_results_keyboard(*, page: int, song_ids: list[int]) -> InlineKeyboardMarkup:
+    """Number buttons 1..N for current page; callback carries real song_id."""
+    total = len(song_ids)
+    start = page * PAGE_SIZE
+    page_ids = song_ids[start : start + PAGE_SIZE]
+    count = len(page_ids)
+
+    rows: list[list[InlineKeyboardButton]] = []
+    row1 = [
+        InlineKeyboardButton(text=str(i + 1), callback_data=f"pick:{page_ids[i]}")
+        for i in range(min(5, count))
+    ]
+    if row1:
+        rows.append(row1)
+    if count > 5:
+        row2 = [
+            InlineKeyboardButton(text=str(i + 1), callback_data=f"pick:{page_ids[i]}")
+            for i in range(5, count)
+        ]
+        rows.append(row2)
+
+    nav: list[InlineKeyboardButton] = []
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅", callback_data=f"page:{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="➡", callback_data=f"page:{page + 1}"))
+    if nav:
+        rows.append(nav)
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def track_actions_keyboard(
     *,
     song_db_id: int,
-    preview_url: str | None,
-    video_url: str | None,
-    artist: str,
-    title: str,
+    preview_url: str | None = None,
+    video_url: str | None = None,
+    artist: str = "",
+    title: str = "",
+    lang: str = "uz",
 ) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-
-    listen_row: list[InlineKeyboardButton] = []
-    if preview_url:
-        listen_row.append(InlineKeyboardButton(text="🎧 Tinglash", url=preview_url))
-    else:
-        listen_row.append(
-            InlineKeyboardButton(text="🎧 Tinglash", callback_data=f"listen:{song_db_id}")
-        )
-    rows.append(listen_row)
-
-    rows.append(
-        [
-            InlineKeyboardButton(text="🎬 Klip", callback_data=f"clip:{song_db_id}"),
-            InlineKeyboardButton(text="📝 Lyrics", callback_data=f"lyrics:{song_db_id}"),
-        ]
-    )
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="⭐️ Sevimlilarga qo‘shish",
-                callback_data=f"fav:song:{song_db_id}",
-            )
-        ]
-    )
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def recognition_actions_keyboard(
-    *,
-    title: str,
-    artist: str,
-    source_url: str | None,
-    video_url: str | None,
-) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    if source_url:
-        rows.append([InlineKeyboardButton(text="🎧 Rasmiy manba", url=source_url)])
-    if video_url:
-        rows.append([InlineKeyboardButton(text="🎬 Official video", url=video_url)])
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="📝 Lyrics",
-                callback_data=f"lyrics_text:{artist[:40]}|{title[:40]}",
-            )
-        ]
-    )
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="⭐️ Sevimlilarga qo‘shish",
-                callback_data=f"fav:artist:{artist[:60]}",
-            )
-        ]
-    )
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def video_save_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📤 Video yuborish", callback_data="video:upload")],
-            [InlineKeyboardButton(text="📁 Mening videolarim", callback_data="video:list")],
             [
-                InlineKeyboardButton(text="📂 Kategoriyalar", callback_data="video:categories"),
-                InlineKeyboardButton(text="🔎 Qidirish", callback_data="video:search"),
-            ],
-            [InlineKeyboardButton(text="⭐️ Sevimlilar", callback_data="video:favorites")],
-        ]
-    )
-
-
-def video_categories_keyboard() -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    items = list(VIDEO_CATEGORIES.items())
-    for i in range(0, len(items), 2):
-        chunk = items[i : i + 2]
-        rows.append(
-            [
-                InlineKeyboardButton(text=label, callback_data=f"video:cat:{key}")
-                for key, label in chunk
+                InlineKeyboardButton(text=t(lang, "clip"), callback_data=f"clip:{song_db_id}"),
+                InlineKeyboardButton(text=t(lang, "lyrics"), callback_data=f"lyrics:{song_db_id}"),
             ]
-        )
-    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="video:menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def category_pick_keyboard() -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    items = list(VIDEO_CATEGORIES.items())
-    for i in range(0, len(items), 2):
-        chunk = items[i : i + 2]
-        rows.append(
-            [
-                InlineKeyboardButton(text=label, callback_data=f"video:setcat:{key}")
-                for key, label in chunk
-            ]
-        )
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def saved_video_actions_keyboard(video_id: int, is_favorite: bool) -> InlineKeyboardMarkup:
-    fav_text = "⭐️ Sevimlidan olib tashlash" if is_favorite else "⭐️ Sevimlilarga"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📤 Qayta yuborish", callback_data=f"video:resend:{video_id}"),
-                InlineKeyboardButton(text=fav_text, callback_data=f"video:fav:{video_id}"),
-            ],
-            [InlineKeyboardButton(text="🗑 O‘chirish", callback_data=f"video:del:{video_id}")],
-        ]
-    )
-
-
-def settings_keyboard(language: str, notifications: bool) -> InlineKeyboardMarkup:
-    notif = "🔔 Yoqilgan" if notifications else "🔕 O‘chirilgan"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🇺🇿 O‘zbek", callback_data="settings:lang:uz"),
-                InlineKeyboardButton(text="🇷🇺 Русский", callback_data="settings:lang:ru"),
-                InlineKeyboardButton(text="🇬🇧 English", callback_data="settings:lang:en"),
-            ],
-            [InlineKeyboardButton(text=f"Bildirishnomalar: {notif}", callback_data="settings:notif")],
-            [InlineKeyboardButton(text=f"Joriy til: {language.upper()}", callback_data="settings:noop")],
         ]
     )
 
@@ -162,7 +95,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def clip_keyboard(url: str) -> InlineKeyboardMarkup:
+def clip_keyboard(url: str, lang: str = "uz") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="▶️ Tomosha qilish", url=url)]]
+        inline_keyboard=[[InlineKeyboardButton(text=t(lang, "watch"), url=url)]]
     )

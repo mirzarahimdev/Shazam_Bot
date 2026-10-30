@@ -1,44 +1,132 @@
-from aiogram import F, Router
+import logging
+import shutil
+
+import httpx
+from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.bot.constants import MENU_BUTTONS
-from app.bot.keyboards import clip_keyboard, main_menu_keyboard, track_actions_keyboard
+from app.bot.i18n import t
+from app.bot.keyboards import (
+    PAGE_SIZE,
+    search_results_keyboard,
+    track_actions_keyboard,
+)
 from app.bot.states import SearchStates
 from app.config import get_settings
-from app.database.repositories import FavoriteRepository, SearchHistoryRepository, SongRepository, UserRepository
+from app.database.models import Song
+from app.database.repositories import SearchHistoryRepository, SongRepository, UserRepository
+from app.services.audio_service import AudioService
+from app.services.clip_service import ClipService
 from app.services.lyrics_service import LyricsService
-from app.services.music_service import MusicService
+from app.services.music_service import MusicService, format_duration
 
 router = Router(name="search")
 
 
-@router.message(F.text == "🎵 Musiqa qidirish")
-async def search_entry(message: Message, state: FSMContext) -> None:
-    await state.set_state(SearchStates.waiting_query)
-    await message.answer(
-        "🔍 Qo‘shiq yoki ijrochi nomini yuboring.\n"
-        "Masalan: <code>Imagine Dragons Believer</code>",
-        reply_markup=main_menu_keyboard(),
+async def _user_lang(session: AsyncSession, telegram_id: int) -> str:
+    user = await UserRepository(session).get_by_telegram_id(telegram_id)
+    return user.language if user and user.language else "uz"
+
+
+async def _download_bytes(url: str) -> bytes | None:
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            return response.content
+    except Exception:
+        return None
+
+
+async def _send_song_audio(
+    message: Message,
+    bot: Bot,
+    song: Song,
+    lang: str,
+) -> None:
+    me = await bot.get_me()
+    caption = f"👉 @{me.username}" if me.username else ""
+    kb = track_actions_keyboard(song_db_id=song.id, lang=lang)
+    status = await message.answer("🎧 Yuklanmoqda...")
+
+    async def _try_send(audio_input, *, title: str, performer: str, duration: int | None) -> bool:
+        # Thumbnail ba'zan Telegramda xato beradi — avval usiz yuboramiz
+        try:
+            await message.answer_audio(
+                audio=audio_input,
+                title=title,
+                performer=performer,
+                duration=duration,
+                caption=caption,
+                reply_markup=kb,
+            )
+            return True
+        except Exception as exc:
+            logging.getLogger(__name__).warning("answer_audio failed: %s", exc)
+            return False
+
+    # 1) Tez va ishonchli: Deezer/iTunes preview
+    if song.preview_url:
+        audio_bytes = await _download_bytes(song.preview_url)
+        if audio_bytes:
+            safe_name = "".join(c for c in song.title if c.isalnum() or c in " -_")[:40] or "track"
+            ok = await _try_send(
+                BufferedInputFile(audio_bytes, filename=f"{safe_name}.mp3"),
+                title=song.title,
+                performer=song.artist,
+                duration=30 if (song.duration or 0) > 30 else song.duration,
+            )
+            if ok:
+                await status.delete()
+                return
+
+    # 2) To'liq trek: yt-dlp
+    audio_result = await AudioService().download(song.artist, song.title)
+    if audio_result and audio_result.path.exists():
+        try:
+            ok = await _try_send(
+                FSInputFile(audio_result.path),
+                title=song.title,
+                performer=song.artist,
+                duration=audio_result.duration or song.duration,
+            )
+            if ok:
+                await status.delete()
+                return
+        finally:
+            shutil.rmtree(audio_result.path.parent, ignore_errors=True)
+
+    await status.edit_text(
+        f"❌ Audio yuklab bo‘lmadi.\n🎵 <b>{song.artist} – {song.title}</b>\n{caption}",
+        reply_markup=kb,
     )
 
 
-@router.message(SearchStates.waiting_query, F.text, ~F.text.in_(MENU_BUTTONS))
+def _format_results_page(query: str, lines: list[str], page: int) -> str:
+    start = page * PAGE_SIZE
+    chunk = lines[start : start + PAGE_SIZE]
+    body = "\n".join(f"{i}. {line}" for i, line in enumerate(chunk, start=1))
+    return f"<b>{query}</b>\n\n{body}"
+
+
+@router.message(SearchStates.waiting_query, F.text)
 async def search_query(message: Message, state: FSMContext, session: AsyncSession) -> None:
     query = (message.text or "").strip()
     if not query or query.startswith("/"):
         return
 
+    lang = (await state.get_data()).get("lang") or await _user_lang(session, message.from_user.id)
     if len(query) < 2:
-        await message.answer("Kamida 2 ta belgi yuboring.")
+        await message.answer(t(lang, "min_chars"))
         return
 
-    await message.answer("🔎 Qidirilmoqda...")
+    status = await message.answer(t(lang, "searching"))
 
     settings = get_settings()
     music = MusicService(youtube_api_key=settings.youtube_api_key)
-    tracks = await music.search(query, limit=5)
+    tracks = await music.search(query, limit=30)
 
     user_repo = UserRepository(session)
     user, _ = await user_repo.get_or_create(
@@ -46,16 +134,17 @@ async def search_query(message: Message, state: FSMContext, session: AsyncSessio
         username=message.from_user.username,
         first_name=message.from_user.first_name,
         last_name=message.from_user.last_name,
+        language=lang,
     )
-
-    history = SearchHistoryRepository(session)
-    await history.add(user.id, query, len(tracks))
+    await SearchHistoryRepository(session).add(user.id, query, len(tracks))
 
     if not tracks:
-        await message.answer("❌ Natija topilmadi. Boshqa so‘rov yuboring.")
+        await status.edit_text(t(lang, "not_found"))
         return
 
     song_repo = SongRepository(session)
+    song_ids: list[int] = []
+    lines: list[str] = []
     for track in tracks:
         song = await song_repo.upsert(
             external_id=track.external_id,
@@ -69,133 +158,126 @@ async def search_query(message: Message, state: FSMContext, session: AsyncSessio
             video_url=track.video_url,
             provider=track.provider,
         )
-        text = music.format_track_message(track)
-        kb = track_actions_keyboard(
-            song_db_id=song.id,
-            preview_url=track.preview_url,
-            video_url=track.video_url,
-            artist=track.artist,
-            title=track.title,
-        )
-        if track.cover_url:
-            await message.answer_photo(track.cover_url, caption=text, reply_markup=kb)
-        else:
-            await message.answer(text, reply_markup=kb)
+        song_ids.append(song.id)
+        lines.append(f"{track.artist} - {track.title} {format_duration(track.duration)}")
 
-    await state.set_state(SearchStates.waiting_query)
+    await state.update_data(
+        query=query,
+        page=0,
+        song_ids=song_ids,
+        lines=lines,
+        lang=lang,
+    )
+
+    text = _format_results_page(query, lines, 0)
+    kb = search_results_keyboard(page=0, song_ids=song_ids)
+    await status.edit_text(text, reply_markup=kb)
 
 
-@router.callback_query(F.data.startswith("listen:"))
-async def listen_callback(callback: CallbackQuery, session: AsyncSession) -> None:
-    song_id = int(callback.data.split(":")[1])
+@router.callback_query(F.data.startswith("page:"))
+async def results_page(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    lines: list[str] = data.get("lines") or []
+    song_ids: list[int] = data.get("song_ids") or []
+    query = data.get("query") or ""
+    if not lines or not song_ids:
+        await callback.answer("❌ Qayta qidiring", show_alert=True)
+        return
+
+    page = int(callback.data.split(":")[1])
+    total_pages = max(1, (len(song_ids) + PAGE_SIZE - 1) // PAGE_SIZE)
+    if page < 0 or page >= total_pages:
+        await callback.answer()
+        return
+
+    await state.update_data(page=page)
+    text = _format_results_page(query, lines, page)
+    kb = search_results_keyboard(page=page, song_ids=song_ids)
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("pick:"))
+async def pick_result(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    bot: Bot,
+) -> None:
+    """callback_data = pick:<song_id> — raqam bosilganda shu qo'shiq chiqadi."""
+    lang = await _user_lang(session, callback.from_user.id)
+    try:
+        song_id = int((callback.data or "").split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer(t(lang, "not_found"), show_alert=True)
+        return
+
     song = await SongRepository(session).get_by_id(song_id)
     if not song:
-        await callback.answer("Topilmadi", show_alert=True)
+        await callback.answer(t(lang, "not_found"), show_alert=True)
         return
-    if song.preview_url:
-        await callback.message.answer(f"🎧 Preview: {song.preview_url}")
-    elif song.source_url:
-        await callback.message.answer(f"🔗 Rasmiy manba: {song.source_url}")
-    else:
-        await callback.message.answer("❌ Tinglash havolasi mavjud emas.")
+
     await callback.answer()
+    try:
+        await _send_song_audio(callback.message, bot, song, lang)
+    except Exception:
+        await callback.message.answer(t(lang, "not_found"))
 
 
 @router.callback_query(F.data.startswith("clip:"))
-async def clip_callback(callback: CallbackQuery, session: AsyncSession) -> None:
+async def clip_callback(callback: CallbackQuery, session: AsyncSession, bot: Bot) -> None:
     song_id = int(callback.data.split(":")[1])
     song = await SongRepository(session).get_by_id(song_id)
+    lang = await _user_lang(session, callback.from_user.id)
     if not song:
-        await callback.answer("Topilmadi", show_alert=True)
+        await callback.answer(t(lang, "not_found"), show_alert=True)
         return
 
-    settings = get_settings()
-    music = MusicService(youtube_api_key=settings.youtube_api_key)
-    video = await music.find_official_video(song.artist, song.title)
-
-    text = (
-        "🎬 <b>Official Music Video</b>\n\n"
-        f"🎵 {video['title']}\n"
-    )
-    if video.get("duration"):
-        text += f"⏱️ {video['duration']}\n"
-    text += "\nCopyright himoyalangan videolar yuklab olinmaydi — faqat rasmiy havola beriladi."
-
-    if video.get("thumbnail"):
-        await callback.message.answer_photo(
-            video["thumbnail"],
-            caption=text,
-            reply_markup=clip_keyboard(video["url"]),
-        )
-    else:
-        await callback.message.answer(text, reply_markup=clip_keyboard(video["url"]))
     await callback.answer()
+    status = await callback.message.answer("🎬 Klip yuklanmoqda...")
+
+    clip = await ClipService().download(song.artist, song.title)
+    if not clip or not clip.path.exists():
+        await status.edit_text(t(lang, "not_found"))
+        return
+
+    me = await bot.get_me()
+    caption = f"👉 @{me.username}" if me.username else ""
+    video_file = FSInputFile(clip.path)
+
+    try:
+        await callback.message.answer_video(
+            video=video_file,
+            caption=caption,
+            duration=clip.duration,
+            width=clip.width,
+            height=clip.height,
+            supports_streaming=True,
+        )
+        await status.delete()
+    except Exception:
+        await status.edit_text(t(lang, "not_found"))
+    finally:
+        shutil.rmtree(clip.path.parent, ignore_errors=True)
 
 
 @router.callback_query(F.data.startswith("lyrics:"))
-async def lyrics_callback(callback: CallbackQuery, session: AsyncSession) -> None:
+async def lyrics_callback(callback: CallbackQuery, session: AsyncSession, bot: Bot) -> None:
     song_id = int(callback.data.split(":")[1])
     song = await SongRepository(session).get_by_id(song_id)
+    lang = await _user_lang(session, callback.from_user.id)
     if not song:
-        await callback.answer("Topilmadi", show_alert=True)
+        await callback.answer(t(lang, "not_found"), show_alert=True)
         return
 
+    await callback.answer()
     lyrics_service = LyricsService()
     lyrics = await lyrics_service.get_lyrics(song.artist, song.title)
     if not lyrics:
-        await callback.message.answer("❌ Bu qo‘shiq uchun lyrics topilmadi.")
-    else:
-        await callback.message.answer(lyrics_service.format_lyrics(song.artist, song.title, lyrics))
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("lyrics_text:"))
-async def lyrics_text_callback(callback: CallbackQuery) -> None:
-    payload = callback.data.split(":", 1)[1]
-    if "|" not in payload:
-        await callback.answer("Xato", show_alert=True)
-        return
-    artist, title = payload.split("|", 1)
-    lyrics_service = LyricsService()
-    lyrics = await lyrics_service.get_lyrics(artist, title)
-    if not lyrics:
-        await callback.message.answer("❌ Bu qo‘shiq uchun lyrics topilmadi.")
-    else:
-        await callback.message.answer(lyrics_service.format_lyrics(artist, title, lyrics))
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("fav:"))
-async def favorite_callback(callback: CallbackQuery, session: AsyncSession) -> None:
-    # fav:song:123 or fav:artist:Name
-    parts = callback.data.split(":", 2)
-    if len(parts) < 3:
-        await callback.answer("Xato", show_alert=True)
+        await callback.message.answer(t(lang, "lyrics_not_found"))
         return
 
-    item_type, item_id = parts[1], parts[2]
-    user_repo = UserRepository(session)
-    user, _ = await user_repo.get_or_create(
-        telegram_id=callback.from_user.id,
-        username=callback.from_user.username,
-        first_name=callback.from_user.first_name,
-        last_name=callback.from_user.last_name,
-    )
-
-    title = item_id
-    if item_type == "song":
-        song = await SongRepository(session).get_by_id(int(item_id))
-        if song:
-            title = f"{song.artist} — {song.title}"
-
-    fav_repo = FavoriteRepository(session)
-    _, created = await fav_repo.add(
-        user_id=user.id,
-        item_type=item_type,
-        item_id=item_id,
-        title=title,
-    )
-    if created:
-        await callback.answer("⭐️ Sevimlilarga qo‘shildi")
-    else:
-        await callback.answer("Allaqachon sevimlilarda")
+    me = await bot.get_me()
+    footer = f"\n\n👉 @{me.username}" if me.username else ""
+    text = lyrics_service.format_lyrics(song.artist, song.title, lyrics) + footer
+    for chunk in lyrics_service.split_message(text):
+        await callback.message.answer(chunk)
