@@ -1,18 +1,23 @@
 import html
+import logging
 import re
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 
+logger = logging.getLogger(__name__)
+
+_lyrics_cache: dict[tuple[str, str], Optional[str]] = {}
+
 
 class LyricsService:
-    """Lyrics via lyrics.ovh public API (free, no key)."""
+    """Tez lyrics — faqat lyrics.ovh (2.5s), kesh bilan."""
 
-    API_URL = "https://api.lyrics.ovh/v1/{artist}/{title}"
+    LYRICS_OVH = "https://api.lyrics.ovh/v1/{artist}/{title}"
 
     @staticmethod
     def _clean_title(title: str) -> str:
-        # Remove remaster/feat/from annotations that break lyrics APIs
         cleaned = re.sub(r"\(.*?\)", "", title)
         cleaned = re.sub(r"\[.*?\]", "", cleaned)
         cleaned = re.sub(r"\s+-\s+(feat\.|ft\.|with).*$", "", cleaned, flags=re.I)
@@ -24,30 +29,28 @@ class LyricsService:
         if not artist or not title:
             return None
 
-        candidates = [title, self._clean_title(title)]
-        # also try without "feat. ..."
-        no_feat = re.sub(r"\s+\(feat\..*?\)", "", title, flags=re.I).strip()
-        if no_feat and no_feat not in candidates:
-            candidates.append(no_feat)
+        clean = self._clean_title(title)
+        cache_key = (artist.lower(), clean.lower())
+        if cache_key in _lyrics_cache:
+            return _lyrics_cache[cache_key]
 
-        for candidate in candidates:
-            lyrics = await self._fetch(artist, candidate)
-            if lyrics:
-                return lyrics
-        return None
+        lyrics = await self._lyrics_ovh(artist, clean)
+        if not lyrics and title != clean:
+            lyrics = await self._lyrics_ovh(artist, title)
 
-    async def _fetch(self, artist: str, title: str) -> Optional[str]:
-        url = self.API_URL.format(artist=artist, title=title)
+        _lyrics_cache[cache_key] = lyrics
+        return lyrics
+
+    async def _lyrics_ovh(self, artist: str, title: str) -> Optional[str]:
+        url = self.LYRICS_OVH.format(artist=quote(artist, safe=""), title=quote(title, safe=""))
         try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
+            async with httpx.AsyncClient(timeout=2.5) as client:
                 response = await client.get(url)
-                if response.status_code == 404:
+                if response.status_code != 200:
                     return None
-                response.raise_for_status()
                 data = response.json()
         except Exception:
             return None
-
         lyrics = (data.get("lyrics") or "").strip()
         return lyrics or None
 

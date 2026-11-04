@@ -17,7 +17,12 @@ build/
 .coverage
 htmlcov/
 *.db
+*.db-shm
+*.db-wal
 .DS_Store
 temp/
 tmp/
 media_cache/
+data/
+tools/
+*.zip

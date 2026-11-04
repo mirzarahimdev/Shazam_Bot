@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import quote_plus
@@ -27,20 +28,29 @@ def format_duration(seconds: Optional[int]) -> str:
 
 
 class MusicService:
-    """Legal catalog search via Deezer public API (no API key required)."""
+    """Tez Deezer qidiruv: umumiy + artist top (2 so‘rov parallel)."""
 
     DEEZER_SEARCH = "https://api.deezer.com/search"
+    DEEZER_ARTIST = "https://api.deezer.com/search/artist"
+    DEEZER_ARTIST_TOP = "https://api.deezer.com/artist/{id}/top"
     ITUNES_SEARCH = "https://itunes.apple.com/search"
 
     def __init__(self, youtube_api_key: str = ""):
         self.youtube_api_key = youtube_api_key
 
-    async def search(self, query: str, limit: int = 5) -> list[TrackInfo]:
+    async def search(self, query: str, limit: int = 10) -> list[TrackInfo]:
         query = query.strip()
         if not query or len(query) > 200:
             return []
 
-        tracks = await self._search_deezer(query, limit)
+        # Faqat 2 parallel so‘rov — tezroq
+        general, artist_top = await asyncio.gather(
+            self._search_deezer(query, limit),
+            self._search_artist_top(query, limit),
+        )
+
+        tracks = self._merge_tracks(query, artist_top, general, limit=limit)
+
         if not tracks:
             tracks = await self._search_itunes(query, limit)
 
@@ -49,10 +59,78 @@ class MusicService:
                 track.video_url = self.build_official_video_search_url(track.artist, track.title)
         return tracks
 
+    def _merge_tracks(
+        self,
+        query: str,
+        *groups: list[TrackInfo],
+        limit: int,
+    ) -> list[TrackInfo]:
+        q = query.lower().strip()
+        seen: set[str] = set()
+        merged: list[TrackInfo] = []
+
+        def _key(t: TrackInfo) -> str:
+            return f"{t.provider}:{t.external_id}"
+
+        def _score(t: TrackInfo) -> tuple:
+            artist_l = (t.artist or "").lower()
+            title_l = (t.title or "").lower()
+            return (
+                0 if artist_l == q else 1,
+                0 if q in artist_l else 1,
+                0 if title_l == q else 1,
+                0 if q in title_l else 1,
+                artist_l,
+                title_l,
+            )
+
+        for group in groups:
+            for track in group:
+                k = _key(track)
+                if k in seen:
+                    continue
+                seen.add(k)
+                merged.append(track)
+
+        merged.sort(key=_score)
+        return merged[:limit]
+
+    async def _search_artist_top(self, query: str, limit: int) -> list[TrackInfo]:
+        try:
+            async with httpx.AsyncClient(timeout=6.0) as client:
+                response = await client.get(
+                    self.DEEZER_ARTIST,
+                    params={"q": query, "limit": 1},
+                )
+                response.raise_for_status()
+                artists = (response.json() or {}).get("data") or []
+                if not artists:
+                    return []
+
+                artist_id = artists[0].get("id")
+                if not artist_id:
+                    return []
+
+                top = await client.get(
+                    self.DEEZER_ARTIST_TOP.format(id=artist_id),
+                    params={"limit": limit},
+                )
+                top.raise_for_status()
+                items = (top.json() or {}).get("data") or []
+        except Exception:
+            return []
+
+        results: list[TrackInfo] = []
+        for item in items:
+            track = self._parse_deezer_track(item)
+            if track:
+                results.append(track)
+        return results
+
     async def _search_deezer(self, query: str, limit: int) -> list[TrackInfo]:
         params = {"q": query, "limit": limit}
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=6.0) as client:
                 response = await client.get(self.DEEZER_SEARCH, params=params)
                 response.raise_for_status()
                 data = response.json()
@@ -61,26 +139,34 @@ class MusicService:
 
         results: list[TrackInfo] = []
         for item in data.get("data", []):
-            artist = (item.get("artist") or {}).get("name")
-            album = (item.get("album") or {}).get("title")
-            cover = (item.get("album") or {}).get("cover_medium")
-            if not artist or not item.get("title"):
-                continue
-            results.append(
-                TrackInfo(
-                    external_id=str(item.get("id")),
-                    title=item["title"],
-                    artist=artist,
-                    album=album,
-                    cover_url=cover,
-                    duration=item.get("duration"),
-                    preview_url=item.get("preview"),
-                    source_url=item.get("link"),
-                    video_url=None,
-                    provider="deezer",
-                )
-            )
+            track = self._parse_deezer_track(item)
+            if track:
+                results.append(track)
         return results
+
+    @staticmethod
+    def _parse_deezer_track(item: dict) -> Optional[TrackInfo]:
+        artist = (item.get("artist") or {}).get("name")
+        if not artist or not item.get("title"):
+            return None
+        album_obj = item.get("album") or {}
+        cover = (
+            album_obj.get("cover_xl")
+            or album_obj.get("cover_big")
+            or album_obj.get("cover_medium")
+        )
+        return TrackInfo(
+            external_id=str(item.get("id")),
+            title=item["title"],
+            artist=artist,
+            album=album_obj.get("title"),
+            cover_url=cover,
+            duration=item.get("duration"),
+            preview_url=item.get("preview"),
+            source_url=item.get("link"),
+            video_url=None,
+            provider="deezer",
+        )
 
     async def _search_itunes(self, query: str, limit: int) -> list[TrackInfo]:
         params = {
@@ -90,7 +176,7 @@ class MusicService:
             "limit": limit,
         }
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=6.0) as client:
                 response = await client.get(self.ITUNES_SEARCH, params=params)
                 response.raise_for_status()
                 data = response.json()
@@ -120,63 +206,7 @@ class MusicService:
             )
         return results
 
-    async def find_official_video(self, artist: str, title: str) -> dict:
-        """Return official video metadata. Prefer YouTube Data API; fallback to search URL."""
-        search_url = self.build_official_video_search_url(artist, title)
-        result = {
-            "title": f"{artist} — {title} (Official Music Video)",
-            "thumbnail": None,
-            "duration": None,
-            "url": search_url,
-            "provider": "youtube_search",
-        }
-
-        if not self.youtube_api_key:
-            return result
-
-        params = {
-            "part": "snippet",
-            "q": f"{artist} {title} official music video",
-            "type": "video",
-            "maxResults": 1,
-            "key": self.youtube_api_key,
-        }
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                response = await client.get(
-                    "https://www.googleapis.com/youtube/v3/search",
-                    params=params,
-                )
-                response.raise_for_status()
-                data = response.json()
-            items = data.get("items") or []
-            if not items:
-                return result
-            video_id = items[0]["id"]["videoId"]
-            snippet = items[0]["snippet"]
-            result.update(
-                {
-                    "title": snippet.get("title") or result["title"],
-                    "thumbnail": (snippet.get("thumbnails") or {}).get("medium", {}).get("url"),
-                    "url": f"https://www.youtube.com/watch?v={video_id}",
-                    "provider": "youtube",
-                }
-            )
-        except Exception:
-            return result
-        return result
-
     @staticmethod
     def build_official_video_search_url(artist: str, title: str) -> str:
         q = quote_plus(f"{artist} {title} official music video")
         return f"https://www.youtube.com/results?search_query={q}"
-
-    @staticmethod
-    def format_track_message(track: TrackInfo) -> str:
-        return (
-            f"🎵 <b>{track.title}</b>\n"
-            f"👤 {track.artist}\n"
-            f"💿 {track.album or '—'}\n"
-            f"⏱️ {format_duration(track.duration)}\n"
-            f"🔗 <a href=\"{track.source_url}\">Rasmiy manba</a>"
-        )

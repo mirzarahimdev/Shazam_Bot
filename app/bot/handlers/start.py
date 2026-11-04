@@ -20,13 +20,12 @@ async def _user_lang(session: AsyncSession, telegram_id: int) -> str:
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, session: AsyncSession, state: FSMContext) -> None:
-    await state.clear()
     user = message.from_user
     if not user:
         return
 
     repo = UserRepository(session)
-    await repo.get_or_create(
+    db_user, created = await repo.get_or_create(
         telegram_id=user.id,
         username=user.username,
         first_name=user.first_name,
@@ -34,6 +33,15 @@ async def cmd_start(message: Message, session: AsyncSession, state: FSMContext) 
         language=user.language_code or "uz",
     )
 
+    # Qayta /start — til so‘ralmasin, darhol qidiruv
+    if not created and db_user.language in SUPPORTED_LANGS:
+        lang = db_user.language
+        await state.set_state(SearchStates.waiting_query)
+        await state.update_data(lang=lang)
+        await message.answer(t(lang, "ask_song"), reply_markup=ReplyKeyboardRemove())
+        return
+
+    await state.clear()
     await message.answer(LANGUAGE_PROMPT, reply_markup=language_keyboard())
 
 

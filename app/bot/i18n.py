@@ -50,6 +50,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "watch": "▶️ Tomosha qilish",
         "lang_saved": "✅ Til saqlandi: O'zbekcha\n\n🔍 Qo‘shiq nomini yozing:",
         "ask_song": "🔍 Qo‘shiq nomini yozing:",
+        "loading_clip": "🎬  <i>yuklanmoqda</i>",
+        "loading_lyrics": "📝  <i>yuklanmoqda</i>",
     },
     LANG_UZ_CYRL: {
         "welcome": (
@@ -86,6 +88,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "watch": "▶️ Томоша қилиш",
         "lang_saved": "✅ Тил сақланди: Ўзбекча\n\n🔍 Қўшиқ номини ёзинг:",
         "ask_song": "🔍 Қўшиқ номини ёзинг:",
+        "loading_clip": "🎬  <i>юкланмоқда</i>",
+        "loading_lyrics": "📝  <i>юкланмоқда</i>",
     },
     LANG_RU: {
         "welcome": (
@@ -121,6 +125,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "watch": "▶️ Смотреть",
         "lang_saved": "✅ Язык сохранён: Русский\n\n🔍 Напишите название песни:",
         "ask_song": "🔍 Напишите название песни:",
+        "loading_clip": "🎬  <i>загрузка</i>",
+        "loading_lyrics": "📝  <i>загрузка</i>",
     },
     LANG_EN: {
         "welcome": (
@@ -156,6 +162,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "watch": "▶️ Watch",
         "lang_saved": "✅ Language saved: English\n\n🔍 Type a song name:",
         "ask_song": "🔍 Type a song name:",
+        "loading_clip": "🎬  <i>loading</i>",
+        "loading_lyrics": "📝  <i>loading</i>",
     },
 }
 

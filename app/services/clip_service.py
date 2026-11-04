@@ -1,11 +1,17 @@
 import asyncio
 import logging
+import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from app.services.download_lock import run_exclusive
+from app.services.media_cache import cache_key, cached_path, ensure_root, store_file
+
 logger = logging.getLogger(__name__)
+
+DOWNLOAD_TIMEOUT = 28
 
 
 @dataclass
@@ -15,24 +21,53 @@ class ClipResult:
     duration: Optional[int] = None
     width: Optional[int] = None
     height: Optional[int] = None
+    cache_key: str = ""
+    from_cache: bool = False
 
 
 class ClipService:
-    """Download a music video for native Telegram playback (via yt-dlp)."""
+    """Music video — bitta tez qidiruv, kesh."""
 
-    async def download(self, artist: str, title: str, *, max_height: int = 480) -> Optional[ClipResult]:
-        query = f"{artist} {title} official music video".strip()
-        # Try progressive mp4 first (no ffmpeg merge needed), then any best
-        for fmt in (
-            f"best[height<= {max_height}][ext=mp4]/best[ext=mp4]/best".replace("<= ", "<="),
-            "best",
-        ):
-            result = await asyncio.to_thread(self._download_sync, query, fmt)
+    async def download(self, artist: str, title: str, *, max_height: int = 360) -> Optional[ClipResult]:
+        ensure_root()
+        key = cache_key("clip", artist, title)
+        hit = cached_path(key)
+        if hit:
+            return ClipResult(path=hit, title=title, cache_key=key, from_cache=True)
+
+        async def _job() -> Optional[ClipResult]:
+            again = cached_path(key)
+            if again:
+                return ClipResult(path=again, title=title, cache_key=key, from_cache=True)
+            # Bitta query — kamroq kutish
+            query = f"ytsearch1:{artist} {title} official music video"
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(self._download_sync, query),
+                    timeout=DOWNLOAD_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Clip timeout: %s", query)
+                result = None
+            if not result:
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.to_thread(self._download_sync, f"ytsearch1:{artist} {title}"),
+                        timeout=DOWNLOAD_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    return None
             if result:
-                return result
-        return None
+                stored = store_file(key, result.path)
+                if result.path.parent.name.startswith("clip_"):
+                    shutil.rmtree(result.path.parent, ignore_errors=True)
+                result.path = stored
+                result.cache_key = key
+            return result
 
-    def _download_sync(self, query: str, fmt: str) -> Optional[ClipResult]:
+        return await run_exclusive(key, _job)
+
+    def _download_sync(self, query: str) -> Optional[ClipResult]:
         try:
             import yt_dlp
         except ImportError:
@@ -41,15 +76,17 @@ class ClipService:
         tmp_dir = Path(tempfile.mkdtemp(prefix="clip_"))
         outtmpl = str(tmp_dir / "clip.%(ext)s")
         ydl_opts = {
-            "format": fmt,
+            "format": "18/best[height<=360]/best",
             "outtmpl": outtmpl,
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
-            "default_search": "ytsearch1",
-            "retries": 3,
-            "socket_timeout": 45,
+            "noprogress": True,
+            "retries": 1,
+            "fragment_retries": 1,
+            "socket_timeout": 10,
             "geo_bypass": True,
+            "extractor_args": {"youtube": {"player_client": ["android"]}},
         }
 
         try:
@@ -57,33 +94,45 @@ class ClipService:
                 info = ydl.extract_info(query, download=True)
                 if not info:
                     return None
+
+                top = info
                 if "entries" in info:
                     entries = [e for e in (info.get("entries") or []) if e]
                     if not entries:
                         return None
-                    info = entries[0]
+                    top = entries[0]
 
-                requested = info.get("requested_downloads") or []
-                if requested and requested[0].get("filepath"):
-                    path = Path(requested[0]["filepath"])
+                existing = sorted(tmp_dir.glob("clip.*"), key=lambda p: p.stat().st_mtime)
+                if existing and existing[-1].stat().st_size > 1000:
+                    path = existing[-1]
                 else:
-                    path = Path(ydl.prepare_filename(info))
-                    if not path.exists():
-                        matches = sorted(tmp_dir.glob("clip.*"), key=lambda p: p.stat().st_mtime)
-                        if not matches:
+                    requested = (top or {}).get("requested_downloads") or []
+                    if requested and requested[0].get("filepath"):
+                        path = Path(requested[0]["filepath"])
+                    else:
+                        path = Path(ydl.prepare_filename(top or info))
+                        if not path.exists():
                             return None
-                        path = matches[-1]
 
-                if not path.exists() or path.stat().st_size < 1000:
+                if path.stat().st_size > 49 * 1024 * 1024:
+                    path.unlink(missing_ok=True)
                     return None
+
+                if path.suffix.lower() not in {".mp4", ".mov", ".mkv", ".webm"}:
+                    renamed = path.with_suffix(".mp4")
+                    try:
+                        path.rename(renamed)
+                        path = renamed
+                    except Exception:
+                        pass
 
                 return ClipResult(
                     path=path,
-                    title=info.get("title") or query,
-                    duration=info.get("duration"),
-                    width=info.get("width"),
-                    height=info.get("height"),
+                    title=(top or {}).get("title") or query,
+                    duration=(top or {}).get("duration"),
+                    width=(top or {}).get("width"),
+                    height=(top or {}).get("height"),
                 )
         except Exception as exc:
-            logger.warning("Clip download failed (%s) for %s: %s", fmt, query, exc)
+            logger.warning("Clip download failed (%s): %s", query, exc)
             return None

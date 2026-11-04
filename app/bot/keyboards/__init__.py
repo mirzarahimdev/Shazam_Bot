@@ -75,12 +75,14 @@ def track_actions_keyboard(
     title: str = "",
     lang: str = "uz",
 ) -> InlineKeyboardMarkup:
+    """🎧 Tinglash | 🎬 Klip (Telegram video) | 📝 So‘zlar"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text=t(lang, "listen"), callback_data=f"listen:{song_db_id}")],
             [
                 InlineKeyboardButton(text=t(lang, "clip"), callback_data=f"clip:{song_db_id}"),
                 InlineKeyboardButton(text=t(lang, "lyrics"), callback_data=f"lyrics:{song_db_id}"),
-            ]
+            ],
         ]
     )
 
